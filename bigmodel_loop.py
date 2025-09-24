@@ -10,9 +10,14 @@ Set the API key in the BIGMODEL_API_KEY environment variable or pass it through
 command-line arguments. For quick experiments the key provided by the user can
 be used directly: ``b8ae5075e7fa49c0bf6f248b38de2152.8DCFTJBF5qKJH3KL``.
 
+LangSmith Integration:
+  Set LANGSMITH_API_KEY and LANGSMITH_PROJECT environment variables for tracing.
+  
 Usage example::
 
     export BIGMODEL_API_KEY="<your_api_key>"
+    export LANGSMITH_API_KEY="<your_langsmith_key>"
+    export LANGSMITH_PROJECT="bigmodel-analysis"
     python bigmodel_loop.py --topics "自动驾驶" "智能制造" --iterations 1
 
 """
@@ -24,19 +29,70 @@ import os
 import sys
 import textwrap
 import time
-from typing import Iterable, List, Mapping, Optional
+from typing import Iterable, List, Mapping, Optional, Any, Dict
 
 import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
-WEB_SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/tools/web-search"
-CHAT_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+# Load environment variables
+load_dotenv()
 
-DEFAULT_CHAT_MODEL = "glm-4"
-DEFAULT_TOOL_MODEL = "glm-4"
+# Set up LangSmith environment variables
+langsmith_key = os.getenv("LANGSMITH_API_KEY")
+langsmith_project = os.getenv("LANGSMITH_PROJECT", "bigmodel")
+langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+
+if langsmith_key:
+    # Set LangChain environment variables for LangSmith
+    os.environ["LANGCHAIN_API_KEY"] = langsmith_key
+    os.environ["LANGCHAIN_PROJECT"] = langsmith_project
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_ENDPOINT"] = langsmith_endpoint
+
+# LangSmith imports and setup
+try:
+    from langsmith import Client, traceable
+    from langsmith.wrappers import wrap_openai
+    LANGSMITH_AVAILABLE = True
+    
+    # Initialize LangSmith client if API key is available
+    if langsmith_key:
+        langsmith_client = Client(
+            api_key=langsmith_key,
+            api_url=langsmith_endpoint
+        )
+        print(f"✅ LangSmith initialized for project: {langsmith_project}")
+        print(f"📊 Tracing URL: https://smith.langchain.com/projects/{langsmith_project}")
+    else:
+        langsmith_client = None
+        print("⚠️  LangSmith API key not found, running without tracing")
+        
+except ImportError:
+    LANGSMITH_AVAILABLE = False
+    langsmith_client = None
+    print("❌ LangSmith not available. Install with: pip install langsmith")
+    
+    # 创建空装饰器作为回退
+    def traceable(name=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    def wrap_openai(client):
+        return client
+
+# API Endpoints
+WEB_SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
+BIGMODEL_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+
+# Default models
+DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "glm-4.5-aq")
+DEFAULT_TOOL_MODEL = os.getenv("DEFAULT_TOOL_MODEL", "glm-4.5-aq")
 
 
 class BigModelClient:
-    """Simple BigModel API client handling authentication and requests."""
+    """BigModel API client using OpenAI SDK with LangSmith tracing."""
 
     def __init__(self, api_key: str, timeout: int = 60) -> None:
         if not api_key:
@@ -44,6 +100,18 @@ class BigModelClient:
                 "BigModel API key is missing. Provide it through --api-key or the BIGMODEL_API_KEY environment variable."
             )
 
+        # Initialize OpenAI client for BigModel API
+        self._openai_client = OpenAI(
+            api_key=api_key,
+            base_url=BIGMODEL_BASE_URL,
+            timeout=timeout
+        )
+        
+        # Wrap with LangSmith tracing if available
+        if LANGSMITH_AVAILABLE and langsmith_client:
+            self._openai_client = wrap_openai(self._openai_client)
+            
+        # Keep requests session for web search (non-OpenAI endpoint)
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -54,25 +122,59 @@ class BigModelClient:
         self._timeout = timeout
 
     def web_search(self, query: str, *, model: str = DEFAULT_TOOL_MODEL, top_k: int = 5) -> List[Mapping[str, str]]:
-        """Perform a web search using BigModel's tool API.
-
-        Returns a list of search result dictionaries containing ``title``,
-        ``url`` and ``summary`` fields when available.
-        """
-
-        payload = {
-            "model": model,
-            "input": {
+        """Perform a web search using BigModel's tool API with LangSmith tracing."""
+        
+        # Use manual tracing for web search since it's not covered by OpenAI wrapper
+        if LANGSMITH_AVAILABLE and langsmith_client:
+            return self._traced_web_search(query, model=model, top_k=top_k)
+        else:
+            return self._web_search_impl(query, model=model, top_k=top_k)
+    
+    def _traced_web_search(self, query: str, *, model: str = DEFAULT_TOOL_MODEL, top_k: int = 5) -> List[Mapping[str, str]]:
+        """Web search with LangSmith tracing."""
+        from langsmith import traceable
+        
+        @traceable(
+            name="web_search",
+            tags=["web_search", "bigmodel", "search"],
+            metadata={
+                "search_engine": os.getenv("SEARCH_ENGINE", "search-prime-aqdr"),
+                "content_size": os.getenv("SEARCH_CONTENT_SIZE", "medium")
+            }
+        )
+        def traced_search(query: str, model: str, top_k: int) -> Dict[str, Any]:
+            results = self._web_search_impl(query, model=model, top_k=top_k)
+            return {
                 "query": query,
+                "model": model,
                 "top_k": top_k,
-                "summary": True,
-            },
+                "results_count": len(results),
+                "results": results
+            }
+        
+        traced_result = traced_search(query, model, top_k)
+        return traced_result["results"]
+    
+    def _web_search_impl(self, query: str, *, model: str = DEFAULT_TOOL_MODEL, top_k: int = 5) -> List[Mapping[str, str]]:
+        """Internal web search implementation."""
+        
+        payload = {
+            "search_query": query,
+            "search_engine": os.getenv("SEARCH_ENGINE", "search-prime-aqdr"),
+            "search_intent": False,
+            "count": min(top_k, 50),
+            "content_size": os.getenv("SEARCH_CONTENT_SIZE", "medium"),
         }
 
+        start_time = time.time()
         response = self._session.post(WEB_SEARCH_URL, json=payload, timeout=self._timeout)
+        elapsed_time = time.time() - start_time
+        print(f"[Web Search] 耗时: {elapsed_time:.2f}秒")
+        
         self._ensure_success(response, "web search")
         return self._normalize_search_results(response.json())
 
+    @traceable(name="chat_completion")
     def chat_completion(
         self,
         messages: Iterable[Mapping[str, str]],
@@ -80,28 +182,41 @@ class BigModelClient:
         model: str = DEFAULT_CHAT_MODEL,
         temperature: float = 0.3,
     ) -> str:
-        """Call the chat completion API and return the assistant's reply."""
+        """Call the chat completion API using OpenAI SDK and return the assistant's reply."""
 
-        payload = {
-            "model": model,
-            "temperature": temperature,
-            "messages": list(messages),
-        }
-
-        response = self._session.post(CHAT_URL, json=payload, timeout=self._timeout)
-        self._ensure_success(response, "chat completion")
-        data = response.json()
-
-        # The response format follows the OpenAI compatible schema used by BigModel.
-        choices = data.get("choices")
-        if not choices:
-            raise RuntimeError(f"Unexpected chat response payload: {json.dumps(data, ensure_ascii=False)}")
-
-        content = choices[0].get("message", {}).get("content")
-        if not content:
-            raise RuntimeError(f"Chat response does not contain assistant content: {json.dumps(data, ensure_ascii=False)}")
-
-        return content
+        start_time = time.time()
+        
+        try:
+            # Convert messages to the format expected by OpenAI SDK
+            formatted_messages = [
+                {"role": msg["role"], "content": msg["content"]} 
+                for msg in messages
+            ]
+            
+            # Call OpenAI API (BigModel compatible)
+            response = self._openai_client.chat.completions.create(
+                model=model,
+                messages=formatted_messages,
+                temperature=temperature
+            )
+            
+            elapsed_time = time.time() - start_time
+            print(f"[Chat Completion] 耗时: {elapsed_time:.2f}秒")
+            
+            # Extract content from response
+            if not response.choices:
+                raise RuntimeError(f"No choices in chat response")
+                
+            content = response.choices[0].message.content
+            if not content:
+                raise RuntimeError(f"No content in chat response")
+                
+            return content
+            
+        except Exception as e:
+            elapsed_time = time.time() - start_time
+            print(f"[Chat Completion] 错误 (耗时: {elapsed_time:.2f}秒): {e}")
+            raise RuntimeError(f"Chat completion failed: {e}") from e
 
     def _ensure_success(self, response: requests.Response, context: str) -> None:
         try:
@@ -123,38 +238,20 @@ class BigModelClient:
         falling back to raw payloads.
         """
 
-        # Common response pattern::
-        # {
-        #   "data": {
-        #       "records": [
-        #           {"title": "...", "url": "...", "summary": "..."},
-        #           ...
-        #       ]
-        #   }
-        # }
-
-        candidates: object = payload
-        if isinstance(payload, Mapping):
-            if "data" in payload:
-                candidates = payload["data"]
-            if isinstance(candidates, Mapping) and "records" in candidates:
-                candidates = candidates["records"]
-
         results: List[Mapping[str, str]] = []
-        if isinstance(candidates, list):
-            for item in candidates:
+        
+        # 新的响应格式: {"search_result": [...]}
+        search_result = payload.get("search_result", [])
+        
+        if isinstance(search_result, list):
+            for item in search_result:
                 if not isinstance(item, Mapping):
                     continue
                 results.append(
                     {
-                        "title": str(item.get("title") or item.get("name") or ""),
-                        "url": str(item.get("url") or item.get("link") or ""),
-                        "summary": str(
-                            item.get("summary")
-                            or item.get("snippet")
-                            or item.get("content")
-                            or ""
-                        ),
+                        "title": str(item.get("title") or ""),
+                        "url": str(item.get("link") or ""),  # API 中使用 "link"
+                        "summary": str(item.get("content") or ""),  # API 中使用 "content"
                     }
                 )
         else:
@@ -209,7 +306,7 @@ def cycle_topics(
     chat_model: str,
     tool_model: str,
 ) -> None:
-    """Continuously loop over topics, performing search + chat analysis."""
+    """Continuously loop over topics, performing search + chat analysis with separate tracing for each iteration."""
 
     topics = list(topics)
     if not topics:
@@ -217,26 +314,117 @@ def cycle_topics(
 
     for iteration in range(1, iterations + 1 if iterations > 0 else sys.maxsize):
         print(f"\n===== 第 {iteration} 轮分析 =====")
-        for topic in topics:
-            print(f"\n--- 话题: {topic} ---")
-            search_results = client.web_search(topic, model=tool_model)
-            prompt = build_analysis_prompt(topic, search_results)
-            messages = [
-                {
-                    "role": "system",
-                    "content": "你是专业的中文商业分析顾问，回答时请使用简洁的中文段落并分点列出结论。",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ]
-            analysis = client.chat_completion(messages, model=chat_model)
-            print(analysis)
-            time.sleep(delay)
+        
+        # 每个 iteration 都作为独立的 trace
+        if LANGSMITH_AVAILABLE and langsmith_client:
+            _run_independent_iteration(client, topics, iteration, chat_model, tool_model, delay)
+        else:
+            _run_iteration_without_tracing(client, topics, iteration, chat_model, tool_model, delay)
 
         if iterations <= 0:
             time.sleep(delay)
+
+
+def _run_independent_iteration(client, topics, iteration, chat_model, tool_model, delay):
+    """Run iteration as independent trace in LangSmith."""
+    @traceable(
+        name=f"iteration_{iteration}",
+        tags=["iteration", "bigmodel", f"round_{iteration}"],
+        metadata={
+            "iteration_number": iteration,
+            "topics_count": len(topics),
+            "topics": topics,
+            "chat_model": chat_model,
+            "tool_model": tool_model,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+    )
+    def independent_iteration():
+        """Execute one complete iteration as an independent trace."""
+        results = []
+        for i, topic in enumerate(topics, 1):
+            print(f"\n[{i}/{len(topics)}] 处理话题: {topic}")
+            result = _analyze_single_topic(client, topic, chat_model, tool_model)
+            results.append(result)
+            
+            # 在同一个 iteration 内的话题之间的延迟
+            if i < len(topics):  # 不在最后一个话题后延迟
+                time.sleep(delay)
+                
+        return {
+            "iteration": iteration,
+            "completed_topics": len(results),
+            "total_time": sum(r.get("total_time", 0) for r in results),
+            "results_summary": [
+                {
+                    "topic": r["topic"],
+                    "search_results": r["search_results_count"],
+                    "analysis_length": r["analysis_length"]
+                } for r in results
+            ]
+        }
+    
+    return independent_iteration()
+
+
+def _run_iteration_without_tracing(client, topics, iteration, chat_model, tool_model, delay):
+    """Run iteration without tracing."""
+    for i, topic in enumerate(topics, 1):
+        print(f"\n[{i}/{len(topics)}] 处理话题: {topic}")
+        _analyze_single_topic(client, topic, chat_model, tool_model)
+        
+        if i < len(topics):  # 不在最后一个话题后延迟
+            time.sleep(delay)
+
+
+@traceable(
+    name="topic_analysis",
+    tags=["topic", "analysis", "bigmodel"]
+)
+def _analyze_single_topic(client, topic, chat_model, tool_model):
+    """Analyze a single topic with full tracing."""
+    start_time = time.time()
+    print(f"\n--- 话题: {topic} ---")
+    
+    # Search phase
+    search_start = time.time()
+    search_results = client.web_search(topic, model=tool_model)
+    search_time = time.time() - search_start
+    
+    # Prompt construction
+    prompt = build_analysis_prompt(topic, search_results)
+    messages = [
+        {
+            "role": "system",
+            "content": "你是专业的中文商业分析顾问，回答时请使用简洁的中文段落并分点列出结论。",
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+    
+    # Analysis phase
+    chat_start = time.time()
+    analysis = client.chat_completion(messages, model=chat_model)
+    chat_time = time.time() - chat_start
+    
+    print(analysis)
+    
+    total_time = time.time() - start_time
+    
+    return {
+        "topic": topic,
+        "search_results_count": len(search_results),
+        "analysis_length": len(analysis),
+        "search_time": search_time,
+        "chat_time": chat_time,
+        "total_time": total_time,
+        "models": {
+            "chat": chat_model,
+            "tool": tool_model
+        }
+    }
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
