@@ -1,22 +1,26 @@
-# BigModel Loop Analysis - Dependencies
-# Python 3.9+ required
+# BigModel Loop & Concurrent Executor Dependencies  
+# Core dependencies for BigModel API integration and concurrent execution
 
-# Core HTTP and API client libraries
+# HTTP requests and API communication
 requests>=2.31.0
 openai>=1.0.0
 
-# Environment variable management
+# Environment management
 python-dotenv>=1.0.0
 
-# LangSmith integration for tracing and monitoring
+# LangSmith integration (optional but recommended for tracing)
 langsmith>=0.1.0
 
-# Type hints (for Python < 3.9 compatibility)
+# Type hints support
 typing-extensions>=4.0.0
 
-# Optional: Development and testing tools
-# Uncomment if needed for development
-# pytest>=7.0.0
-# black>=23.0.0
-# mypy>=1.0.0
-# flake8>=6.0.0
+# Note: The following are built-in Python modules used by concurrent_bigmodel.py:
+# - multiprocessing (concurrent execution)
+# - threading (concurrent execution)  
+# - asyncio (async concurrent execution)
+# - concurrent.futures (executor management)
+# - dataclasses (data structures)
+# - logging (error handling and monitoring)
+# - argparse (command line interface)
+# - signal (graceful shutdown)
+# - json, time, os, sys (utilities)
