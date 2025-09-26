@@ -38,49 +38,103 @@ from openai import OpenAI
 # Load environment variables
 load_dotenv()
 
-# Set up LangSmith environment variables
-langsmith_key = os.getenv("LANGSMITH_API_KEY")
-langsmith_project = os.getenv("LANGSMITH_PROJECT", "bigmodel")
-langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+# Global variables for LangSmith
+LANGSMITH_AVAILABLE = False
+langsmith_client = None
 
-if langsmith_key:
-    # Set LangChain environment variables for LangSmith
-    os.environ["LANGCHAIN_API_KEY"] = langsmith_key
-    os.environ["LANGCHAIN_PROJECT"] = langsmith_project
-    os.environ["LANGCHAIN_TRACING_V2"] = "true"
-    os.environ["LANGCHAIN_ENDPOINT"] = langsmith_endpoint
-
-# LangSmith imports and setup
-try:
-    from langsmith import Client, traceable
-    from langsmith.wrappers import wrap_openai
-    LANGSMITH_AVAILABLE = True
+# 默认的mock装饰器和函数
+def traceable(name=None, **kwargs):
+    def decorator(func):
+        return func
+    return decorator
     
-    # Initialize LangSmith client if API key is available
-    if langsmith_key:
+def wrap_openai(client):
+    return client
+
+def setup_langsmith(enable_langsmith=None):
+    """设置LangSmith追踪
+    
+    Args:
+        enable_langsmith: 是否启用LangSmith。如果为None，则根据环境变量自动判断
+    
+    Returns:
+        bool: 是否成功启用LangSmith
+    """
+    global LANGSMITH_AVAILABLE, langsmith_client, traceable, wrap_openai
+    
+    # 获取环境变量
+    langsmith_key = os.getenv("LANGSMITH_API_KEY")
+    langsmith_project = os.getenv("LANGSMITH_PROJECT", "bigmodel")
+    langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    
+    # 决定是否启用LangSmith
+    if enable_langsmith is None:
+        enable_langsmith = bool(langsmith_key)
+    
+    # 如果强制禁用或没有API key，则不启用
+    if not enable_langsmith or not langsmith_key:
+        LANGSMITH_AVAILABLE = False
+        langsmith_client = None
+        
+        # 清除LangSmith相关环境变量
+        for key in ["LANGCHAIN_API_KEY", "LANGCHAIN_PROJECT", "LANGCHAIN_TRACING_V2", "LANGCHAIN_ENDPOINT"]:
+            if key in os.environ:
+                del os.environ[key]
+        
+        # 创建mock装饰器和函数
+        def traceable(name=None, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+            
+        def wrap_openai(client):
+            return client
+        
+        if not langsmith_key:
+            print("⚠️  LangSmith API key not found, running without tracing")
+        else:
+            print("ℹ️  LangSmith tracing disabled by user")
+        
+        return False
+    
+    # 尝试导入和初始化LangSmith
+    try:
+        from langsmith import Client, traceable
+        from langsmith.wrappers import wrap_openai
+        LANGSMITH_AVAILABLE = True
+        
+        # Set LangChain environment variables for LangSmith
+        os.environ["LANGCHAIN_API_KEY"] = langsmith_key
+        os.environ["LANGCHAIN_PROJECT"] = langsmith_project
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_ENDPOINT"] = langsmith_endpoint
+        
+        # Initialize LangSmith client
         langsmith_client = Client(
             api_key=langsmith_key,
             api_url=langsmith_endpoint
         )
         print(f"✅ LangSmith initialized for project: {langsmith_project}")
         print(f"📊 Tracing URL: https://smith.langchain.com/projects/{langsmith_project}")
-    else:
-        langsmith_client = None
-        print("⚠️  LangSmith API key not found, running without tracing")
+        return True
         
-except ImportError:
-    LANGSMITH_AVAILABLE = False
-    langsmith_client = None
-    print("❌ LangSmith not available. Install with: pip install langsmith")
-    
-    # 创建空装饰器作为回退
-    def traceable(name=None, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-    
-    def wrap_openai(client):
-        return client
+    except ImportError:
+        LANGSMITH_AVAILABLE = False
+        
+        # 创建mock装饰器和函数
+        def traceable(name=None, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+            
+        def wrap_openai(client):
+            return client
+        
+        print("⚠️  LangSmith package not installed, running without tracing")
+        return False
+
+# 初始化时不自动设置LangSmith（将在main函数中根据参数设置）
+# setup_langsmith()
 
 # API Endpoints
 WEB_SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
@@ -463,11 +517,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=DEFAULT_TOOL_MODEL,
         help="Tool (web search) model name.",
     )
+    parser.add_argument(
+        "--enable-langsmith",
+        action="store_true",
+        help="强制启用 LangSmith 追踪（默认自动检测）"
+    )
+    parser.add_argument(
+        "--disable-langsmith",
+        action="store_true",
+        help="强制禁用 LangSmith 追踪"
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    # 设置 LangSmith 开关
+    enable_langsmith = None
+    if args.enable_langsmith:
+        enable_langsmith = True
+    if args.disable_langsmith:
+        enable_langsmith = False
+    setup_langsmith(enable_langsmith=enable_langsmith)
 
     try:
         client = BigModelClient(api_key=args.api_key)

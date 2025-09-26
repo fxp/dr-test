@@ -41,7 +41,8 @@ from bigmodel_loop import (
     BigModelClient, 
     build_analysis_prompt, 
     DEFAULT_CHAT_MODEL, 
-    DEFAULT_TOOL_MODEL
+    DEFAULT_TOOL_MODEL,
+    setup_langsmith
 )
 
 # 加载环境变量
@@ -578,6 +579,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="静默模式，减少日志输出"
     )
+    parser.add_argument(
+        "--enable-langsmith",
+        action="store_true",
+        help="强制启用 LangSmith 追踪（默认自动检测）"
+    )
+    parser.add_argument(
+        "--disable-langsmith",
+        action="store_true",
+        help="强制禁用 LangSmith 追踪"
+    )
     
     return parser.parse_args()
 
@@ -589,6 +600,14 @@ def main():
     # 配置日志级别
     if args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
+    
+    # 设置 LangSmith 开关
+    enable_langsmith = None
+    if args.enable_langsmith:
+        enable_langsmith = True
+    if args.disable_langsmith:
+        enable_langsmith = False
+    setup_langsmith(enable_langsmith=enable_langsmith)
     
     # 验证API key
     if not args.api_key:
