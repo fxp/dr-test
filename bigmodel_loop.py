@@ -223,10 +223,26 @@ class BigModelClient:
         start_time = time.time()
         response = self._session.post(WEB_SEARCH_URL, json=payload, timeout=self._timeout)
         elapsed_time = time.time() - start_time
-        print(f"[Web Search] 耗时: {elapsed_time:.2f}秒")
         
         self._ensure_success(response, "web search")
-        return self._normalize_search_results(response.json())
+        results = self._normalize_search_results(response.json())
+        
+        # 打印搜索结果摘要
+        print(f"[Web Search] 耗时: {elapsed_time:.2f}秒, 返回 {len(results)} 个结果")
+        print(f"🔍 搜索查询: '{query}' (引擎: {payload['search_engine']})")
+        if results:
+            print("📋 搜索结果预览:")
+            for i, result in enumerate(results[:3], 1):  # 只显示前3个
+                title = result.get('title', '无标题')[:50]
+                url = result.get('url', '无链接')[:60]
+                print(f"  {i}. {title}...")
+                print(f"     🔗 {url}")
+            if len(results) > 3:
+                print(f"     ... 还有 {len(results) - 3} 个结果")
+        else:
+            print("⚠️  没有找到搜索结果")
+        
+        return results
 
     @traceable(name="chat_completion")
     def chat_completion(
